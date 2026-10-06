@@ -16,9 +16,10 @@ import runpod
 import torch
 from datasets import Dataset
 from peft import LoraConfig, PeftModel, get_peft_model
-from transformers import AutoModelForCausalLM, AutoTokenizer, Trainer, TrainingArguments
+from transformers import AutoModelForCausalLM, AutoTokenizer, Trainer, TrainingArguments, TrainerCallback
 
 BASE = "Qwen/Qwen3-0.6B"
+REVISION = "c1899de289a04d12100db370d81485cdf75e47ca"
 ROOT = Path("/runpod-volume/hydra")
 
 def progress(job, stage, message):
@@ -46,7 +47,7 @@ def local_adapter(path):
 def handler(job):
     started = time.monotonic()
     data = job["input"]
-    if data.get("baseModel") != BASE or not torch.cuda.is_available():
+    if data.get("baseModel") != BASE or data.get("baseRevision") != REVISION or not torch.cuda.is_available():
         raise ValueError("Approved base model and a CUDA GPU are required")
     if not re.fullmatch(r"[a-zA-Z0-9_-]{1,80}", data["agentId"]) or not re.fullmatch(r"[a-zA-Z0-9_-]{1,80}", data["jobId"]):
         raise ValueError("Invalid artifact identifier")
@@ -56,9 +57,9 @@ def handler(job):
             raise ValueError("Persistent artifact volume is not mounted")
     torch.manual_seed(42)
     progress(job, "load", "model.load Qwen3-0.6B dtype=bfloat16 device=cuda")
-    tokenizer = AutoTokenizer.from_pretrained(BASE, trust_remote_code=False)
+    tokenizer = AutoTokenizer.from_pretrained(BASE, revision=REVISION, trust_remote_code=False)
     tokenizer.pad_token = tokenizer.eos_token
-    model = AutoModelForCausalLM.from_pretrained(BASE, torch_dtype=torch.bfloat16, trust_remote_code=False).to("cuda")
+    model = AutoModelForCausalLM.from_pretrained(BASE, revision=REVISION, torch_dtype=torch.bfloat16, trust_remote_code=False).to("cuda")
     parent = local_adapter(data.get("parentAdapter"))
     if parent:
         model = PeftModel.from_pretrained(model, parent, is_trainable=data.get("mode") == "train")
@@ -68,7 +69,7 @@ def handler(job):
                     {"role": "user", "content": data.get("prompt", "")[:4000] + "\n\nVerified source context:\n" + context}]
         prompt = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True, enable_thinking=False)
         encoded = tokenizer(prompt, return_tensors="pt", truncation=True, max_length=4096).to("cuda")
-        progress(job, "inference", "model.generate max_new_tokens=768 temperature=0.2")
+        progress(job, "inference", "model.generate max_new_tokens=768 decoding=greedy")
         with torch.no_grad():
             result = model.generate(**encoded, max_new_tokens=768, do_sample=False, pad_token_id=tokenizer.eos_token_id)
         text = tokenizer.decode(result[0][encoded.input_ids.shape[1]:], skip_special_tokens=True)
@@ -103,16 +104,20 @@ def handler(job):
     if not parent:
         model = get_peft_model(model, LoraConfig(r=16, lora_alpha=32, target_modules=["q_proj", "v_proj"], lora_dropout=0.05, task_type="CAUSAL_LM"))
     progress(job, "train", f"lora.train steps=100 examples={len(train)} held_out={len(evaluation)} baseline_loss={baseline:.6f}")
-    trainer = Trainer(model=model, args=args, train_dataset=train_set, eval_dataset=eval_set)
+    class TraceCallback(TrainerCallback):
+        def on_log(self, args, state, control, logs=None, **kwargs):
+            values = {k: v for k, v in (logs or {}).items() if k in ('loss', 'learning_rate', 'grad_norm', 'epoch', 'eval_loss')}
+            progress(job, 'train', f"step={state.global_step} metrics={json.dumps(values)}")
+    trainer = Trainer(model=model, args=args, train_dataset=train_set, eval_dataset=eval_set, callbacks=[TraceCallback()])
     trainer.train()
     candidate = trainer.evaluate()["eval_loss"]
     model.save_pretrained(str(path), safe_serialization=True)
     tokenizer.save_pretrained(str(path))
     manifests = {p.name: hashlib.sha256(p.read_bytes()).hexdigest() for p in path.glob('adapter*') if p.is_file()}
-    (path / 'manifest.json').write_text(json.dumps({"baseModel": BASE, "datasetHash": data["datasetHash"], "baselineLoss": baseline, "candidateLoss": candidate, "files": manifests}, indent=2))
+    (path / 'manifest.json').write_text(json.dumps({"baseModel": BASE, "baseRevision": REVISION, "datasetHash": data["datasetHash"], "baselineLoss": baseline, "candidateLoss": candidate, "files": manifests}, indent=2))
     torch.cuda.synchronize()
     progress(job, "evaluate", f"eval.complete baseline={baseline:.6f} candidate={candidate:.6f} checkpoint_saved=true")
-    return {"adapterPath": str(path), "datasetHash": data["datasetHash"], "baselineLoss": baseline,
+    return {"adapterPath": str(path), "baseRevision": REVISION, "artifactHashes": manifests, "datasetHash": data["datasetHash"], "baselineLoss": baseline,
             "candidateLoss": candidate, "evaluationCount": len(evaluation), "gpuSeconds": time.monotonic() - started}
 
 runpod.serverless.start({"handler": handler})
