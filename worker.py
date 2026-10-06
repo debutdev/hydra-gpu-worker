@@ -129,20 +129,32 @@ def browse(job, model, tokenizer):
         context.route('**/*', route_request)
         page = context.pages[0] if context.pages else context.new_page()
         page.on('dialog', lambda dialog: dialog.dismiss())
-        action = {'action':'navigate','url':urls[0]}
+        first = int(hashlib.sha256(data['jobId'].encode()).hexdigest()[:8],16) % len(urls)
+        action = {'action':'navigate','url':urls[first]}
+        visited = set()
+        reading_started = time.monotonic()
         try:
             for step in range(12):
                 if time.monotonic()>deadline:
                     break
                 kind = action.get('action')
                 if kind=='finish':
-                    break
+                    unvisited = [u for u in urls if u not in visited]
+                    if unvisited:
+                        action = {'action':'navigate','url':unvisited[0]}
+                        kind = 'navigate'
+                    elif time.monotonic()-reading_started < 45:
+                        action = {'action':'scroll'}
+                        kind = 'scroll'
+                    else:
+                        break
                 try:
                     if kind=='navigate' and allowed(action.get('url','')):
                         target = action['url']
                         narrate(job, model, tokenizer, 'Objective: '+data.get('prompt','')[:500]+'\nI am about to open '+target+'. State what I will inspect, without inventing findings.')
                         progress(job,'browser','browser.navigate '+target)
                         page.goto(target, wait_until='domcontentloaded', timeout=10000)
+                        visited.add(target)
                     elif kind=='scroll':
                         page.mouse.wheel(0,600)
                         progress(job,'browser','browser.scroll url='+page.url)
@@ -247,7 +259,7 @@ def execute_job(job):
         encoded = tokenizer(prompt, return_tensors="pt", truncation=True, max_length=4096).to("cuda")
         progress(job, "inference", "model.generate max_new_tokens=768 decoding=greedy")
         with torch.no_grad():
-            result = model.generate(**encoded, max_new_tokens=768, do_sample=False, pad_token_id=tokenizer.eos_token_id)
+            result = model.generate(**encoded, max_new_tokens=768, do_sample=False, no_repeat_ngram_size=4, repetition_penalty=1.12, pad_token_id=tokenizer.eos_token_id)
         text = tokenizer.decode(result[0][encoded.input_ids.shape[1]:], skip_special_tokens=True)
         torch.cuda.synchronize()
         return {"text": text, "gpuSeconds": time.monotonic() - started}
