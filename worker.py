@@ -12,6 +12,7 @@ import os
 from pathlib import Path
 import re
 import time
+import threading
 from concurrent.futures import ThreadPoolExecutor
 from urllib.parse import urlparse
 
@@ -189,10 +190,12 @@ def browse(job, model, tokenizer):
     return '\n\n'.join(notes)[-18000:]
 
 def progress(job, stage, message):
+    if stage != "heartbeat":
+        job["_public_stage"] = stage
     data = job["input"]
     callback = data.get("callbackUrl", "")
     parsed = urlparse(callback)
-    if parsed.scheme != "https" or parsed.hostname != os.environ.get("HYDRA_CALLBACK_HOST", "trygacha.fun"):
+    if parsed.scheme != "https" or parsed.hostname != os.environ.get("HYDRA_CALLBACK_HOST", "usehydra.fun"):
         raise ValueError("Unexpected callback origin")
     if not parsed.path.startswith("/api/hydra/compute/"):
         raise ValueError("Unexpected callback path")
@@ -210,7 +213,7 @@ def local_adapter(path):
         raise ValueError("Adapter must be on HYDRA's persistent volume")
     return str(resolved)
 
-def handler(job):
+def execute_job(job):
     started = time.monotonic()
     data = job["input"]
     if data.get("baseModel") != BASE or data.get("baseRevision") != REVISION or not torch.cuda.is_available():
@@ -292,5 +295,24 @@ def handler(job):
     progress(job, "evaluate", f"eval.complete baseline={baseline:.6f} candidate={candidate:.6f} checkpoint_saved=true")
     return {"adapterPath": str(path), "baseRevision": REVISION, "artifactHashes": manifests, "datasetHash": data["datasetHash"], "baselineLoss": baseline,
             "candidateLoss": candidate, "evaluationCount": len(evaluation), "gpuSeconds": time.monotonic() - started}
+
+def handler(job):
+    stop = threading.Event()
+    def heartbeat():
+        while not stop.wait(30):
+            try:
+                progress(job, "heartbeat", "worker.active stage="+job.get("_public_stage", "load"))
+            except Exception:
+                pass
+    thread = None
+    if job.get("input", {}).get("agentId") == "hydra" and job["input"].get("mode") in ("research", "train"):
+        thread = threading.Thread(target=heartbeat, daemon=True)
+        thread.start()
+    try:
+        return execute_job(job)
+    finally:
+        stop.set()
+        if thread:
+            thread.join(timeout=11)
 
 runpod.serverless.start({"handler": handler})
