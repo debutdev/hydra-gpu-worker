@@ -12,6 +12,7 @@ import os
 from pathlib import Path
 import re
 import time
+from concurrent.futures import ThreadPoolExecutor
 from urllib.parse import urlparse
 
 import requests
@@ -24,6 +25,52 @@ from transformers import AutoModelForCausalLM, AutoTokenizer, Trainer, TrainingA
 BASE = "Qwen/Qwen3-0.6B"
 REVISION = "c1899de289a04d12100db370d81485cdf75e47ca"
 ROOT = Path("/runpod-volume/hydra")
+
+def model_snapshot(job):
+    """Fetch and validate the pinned files explicitly before using local loaders.
+
+    Some provider Hub caches can return an empty auto-configuration. A verified
+    local snapshot avoids silently accepting that cache entry.
+    """
+    files = {
+        'config.json': (726, 'f5c3703b78ae2a478ae15b247e9f855e0ce2107b', False),
+        'generation_config.json': (239, '20a8a9156fc8c3f25295ca067f61fdf120d517c5', False),
+        'merges.txt': (1671853, '31349551d90c7606f325fe0f11bbb8bd5fa0d7c7', False),
+        'model.safetensors': (1503300328, 'f47f71177f32bcd101b7573ec9171e6a57f4f4d31148d38e382306f42996874b', True),
+        'tokenizer.json': (11422654, 'aeb13307a71acd8fe81861d94ad54ab689df773318809eed3cbe794b4492dae4', True),
+        'tokenizer_config.json': (9732, '417d038a63fa3de29cfde265caedae14d1a58d92', False),
+        'vocab.json': (2776833, '4783fe10ac3adce15ac8f358ef5462739852c569', False),
+    }
+    destination = ROOT / 'base' / REVISION
+    destination.mkdir(parents=True, exist_ok=True)
+    def download(item):
+        name, (size, expected, lfs) = item
+        target = destination / name
+        marker = destination / (name + '.verified')
+        if target.exists() and target.stat().st_size == size and marker.exists() and marker.read_text()==expected:
+            return
+        digest = hashlib.sha256() if lfs else hashlib.sha1()
+        if not lfs:
+            digest.update(f'blob {size}\0'.encode())
+        temporary = destination / (name + '.partial')
+        with requests.get(f'https://huggingface.co/{BASE}/resolve/{REVISION}/{name}', stream=True, timeout=(10,30)) as response:
+            response.raise_for_status()
+            with temporary.open('wb') as out:
+                for chunk in response.iter_content(1024*1024):
+                    digest.update(chunk)
+                    out.write(chunk)
+        if temporary.stat().st_size != size or digest.hexdigest()!=expected:
+            temporary.unlink(missing_ok=True)
+            raise ValueError('Pinned model file verification failed: '+name)
+        temporary.replace(target)
+        marker.write_text(expected)
+    progress(job, 'load', 'checkpoint.verify revision='+REVISION+' files=7')
+    with ThreadPoolExecutor(max_workers=3) as executor:
+        list(executor.map(download, files.items()))
+    if json.loads((destination/'config.json').read_text()).get('model_type')!='qwen3':
+        raise ValueError('Pinned checkpoint is not Qwen3')
+    progress(job, 'load', 'checkpoint.verified model_type=qwen3 weights_sha256='+files['model.safetensors'][1])
+    return str(destination)
 
 def browse(job, model, tokenizer):
     """Stream genuine remote Chromium frames; no local desktop/profile access."""
@@ -137,9 +184,10 @@ def handler(job):
             raise ValueError("Persistent artifact volume is not mounted")
     torch.manual_seed(42)
     progress(job, "load", "model.load Qwen3-0.6B dtype=bfloat16 device=cuda")
-    tokenizer = AutoTokenizer.from_pretrained(BASE, revision=REVISION, trust_remote_code=False)
+    snapshot = model_snapshot(job)
+    tokenizer = AutoTokenizer.from_pretrained(snapshot, local_files_only=True, trust_remote_code=False)
     tokenizer.pad_token = tokenizer.eos_token
-    model = AutoModelForCausalLM.from_pretrained(BASE, revision=REVISION, torch_dtype=torch.bfloat16, trust_remote_code=False).to("cuda")
+    model = AutoModelForCausalLM.from_pretrained(snapshot, local_files_only=True, torch_dtype=torch.bfloat16, trust_remote_code=False).to("cuda")
     parent = local_adapter(data.get("parentAdapter"))
     if parent:
         model = PeftModel.from_pretrained(model, parent, is_trainable=data.get("mode") == "train")

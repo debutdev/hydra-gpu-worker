@@ -9,3 +9,5 @@ Server configuration: `RUNPOD_API_KEY`, `RUNPOD_ENDPOINT_ID`, `RUNPOD_NETWORK_VO
 Training requires 10–200 unique examples. The server deterministically separates 20% for evaluation; the worker prevents prompt overlap, evaluates the baseline and candidate on the same held-out data, saves the adapter and a hash manifest, and returns measurable results. Shared releases require curator approval. Network volume storage incurs ongoing provider storage charges, and approved checkpoints should also be backed up externally.
 
 Research only consumes approved source context. It does not execute text from web pages or grant the model wallet signing access.
+
+Research jobs launch isolated Chromium, select an approved document with the model, navigate and scroll, stream real JPEG frames through a per-job capability, and close the session after the bounded browsing phase. No local browser profile, wallet extension or authenticated user session is mounted. The latest capture is shown as idle once frames stop.
