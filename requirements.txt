@@ -5,3 +5,4 @@ accelerate==1.6.0
 datasets==3.5.0
 requests==2.32.4
 safetensors==0.5.3
+playwright==1.63.0
